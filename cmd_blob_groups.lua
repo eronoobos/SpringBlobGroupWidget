@@ -176,7 +176,7 @@ end
 
 local function CreateBlob(groupID)
 	if blobs[groupID] then return end
-	local blob = { groupID = groupID, guardDistance = 100 }
+	local blob = { groupID = groupID, guardDistance = 100, speed = 0 }
 	blobs[groupID] = blob
 	blobCount = blobCount + 1
 end
@@ -217,7 +217,9 @@ local function EvaluateUnits(blob, gameFrame)
 			local health, maxHealth = Spring.GetUnitHealth(unitID)
 			unit.damaged = health < maxHealth
 			if unit.damaged then table.insert(blob.needsRepair, unitID) end
-			if not unit.angle then
+			if unit.angle or unit.willSlot or (info.isCombatant and info.speed > blob.speed) then
+
+			else
 				-- for units on the interior currently
 				if info.size > maxSizeInterior then maxSizeInterior = info.size end
 				local ux, uy, uz = Spring.GetUnitPosition(unitID)
@@ -261,12 +263,14 @@ local function SortUnits(blob)
 		local info = GetUnitDefInfo(unitDefID)
 		for i, unitID in pairs(units) do
 			local unit = unitsByID[unitID]
+			unit.willSlot = false
 			if unit then
 				local target = unitsByID[unit.targetID]
-				if humanOrdersLeft > 1 or not unit.hasHumanOrder then
-					unit.hasHumanOrder = nil
+				if not unit.constructing and not unit.hasHumanOrder then
 					if info.isCombatant and info.speed > blob.speed then
 						local gx, gy, gz = Spring.GetUnitPosition(unitID)
+						unit.x, unit.y, unit.z = gx, gy, gz
+						-- Spring.Echo(blob.x, blob.z, blob.vx, blob.vz, gx, gz, unitID)
 						local dist = Distance(blob.x, blob.z, gx, gz)
 						if dist > distanceCutOff then
 							if not target then table.insert(blob.willGuard, unit) end
@@ -278,6 +282,7 @@ local function SortUnits(blob)
 								table.insert(blob.slotted, unit)
 							else
 								blob.needSlotting = true
+								unit.willSlot = true
 								table.insert(blob.willSlot, unit)
 							end
 							if blob.underFire then
@@ -301,7 +306,11 @@ local function SortUnits(blob)
 							end
 							if assist then table.insert(blob.willAssist, unit) end
 						else
-							if not target then table.insert(blob.willGuard, unit) end
+							if not target then
+								table.insert(blob.willGuard, unit)
+							elseif not target.constructing and not target.damaged then
+								table.insert(blob.willGuard, unit)
+							end
 						end
 					end
 				else
@@ -456,9 +465,19 @@ end
 local function AssignRemaining(blob)
 	if #blob.willGuard == 0 then return end
 	for ui, unit in pairs(blob.willGuard) do
-		local ti = random(1, #blob.hasHumanOrder)
-		local unitID = blob.hasHumanOrder[ti].unitID
-		GiveCommand(unit.unitID, CMD.GUARD, {unitID})
+		local unitID
+		if #blob.hasHumanOrder == 0 then
+			if #blob.willGuard > 1 then
+				for ti = 1, #blob.willGuard do
+					local target = blob.willGuard[ti]
+					if target ~= unit then unitID = target.unitID end
+				end
+			end
+		else
+			local ti = random(1, #blob.hasHumanOrder)
+			unitID = blob.hasHumanOrder[ti].unitID
+		end
+		if unitID then GiveCommand(unit.unitID, CMD.GUARD, {unitID}) end
 	end
 end
 
@@ -484,7 +503,7 @@ function widget:GroupChanged(groupID)
 end
 
 function widget:UnitCommand(unitID, unitDefID, unitTeam, cmdID, cmdOpts, cmdParams, cmdTag)
-	if not interruptCmd[cmdID] then return end
+	if not interruptCmd[cmdID] and cmdID >= 0 then return end
 	-- check if this unit is in a group
 	local unit = unitsByID[unitID]
 	if not unit then return end
@@ -514,6 +533,20 @@ function widget:UnitIdle(unitID, unitDefID, teamID)
 	unit.hasHumanOrder = nil
 end
 
+function widget:UnitCreated(unitID, unitDefID, teamID, builderID)
+	local unit = unitsByID[builderID]
+	if not unit then return end
+	local register = false
+	if unit.hasHumanOrder then
+		if unit.hasHumanOrder.cmdID ~= -unitDefID then
+			register = true
+		end
+	else
+		register = true
+	end
+	if register then unit.hasHumanOrder = { cmdID = 99999, cmdParams = { unitID, unitDefID }, cmdOpts = {} } end
+end
+
 function widget:UnitDestroyed(unitID, unitDefID, teamID, attackerID, attackerDefID, attackerTeamID)
 	ClearUnit(unitID)
 end
@@ -524,7 +557,10 @@ end
 
 function widget:GameFrame(gameFrame)
 	if gameFrame % 30 == 0 then
-		-- Spring.GetGroupUnitsSorted
+		for unitID, unit in pairs(unitsByID) do
+			local groupID = Spring.GetUnitGroup(unitID)
+			if not groupID then ClearUnit(unitID) end
+		end
 		for groupID, blob in pairs(blobs) do
 			local unitCount = Spring.GetGroupUnitsCount(groupID)
 			if unitCount > 1 then
