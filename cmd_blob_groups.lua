@@ -57,7 +57,6 @@ local interruptCmd = {
 	[90] = true,
 	[125] = true,
 	[130] = true,
-	[140] = true,
 }
 
 
@@ -121,7 +120,9 @@ local function GetUnitDefInfo(defID)
 	local z = uDef.zsize * 8
 	local size = ceil(Pythagorean(x, z))
 	local range = GetLongestWeaponRange(uDef)
-	local isCombatant = uDef.canAttack and not uDef.canFly and not uDef.canAssist and not uDef.canRepair
+	local ratio = ((uDef.health * uDef.speed) / uDef.metalCost) / range
+	-- stumpy (1530 * 87 / 201) / 350 = 1.89
+	local isCombatant = ratio > 1 and uDef.canAttack and not uDef.canFly and not uDef.canAssist and not uDef.canRepair
 	local info = { isCombatant = isCombatant, speed = uDef.speed, size = size, range = range, canMove = uDef.canMove, canAttack = uDef.canAttack, canAssist = uDef.canAssist, canRepair = uDef.canRepair, canFly = uDef.canFly }
 	infosByDefID[defID] = info
 	return info
@@ -141,6 +142,10 @@ local function GiveCommand(unitID, cmdID, cmdParams)
 			end
 		end
 	end
+end
+
+local function CloneOrder(unitID, order)
+	GiveCommand(unitID, order.cmdID, order.cmdParams)
 end
 
 local function SetMoveState(unit, moveState)
@@ -250,6 +255,7 @@ local function EvaluateUnits(blob, gameFrame)
 end
 
 local function SortUnits(blob)
+	blob.ordersByDef = {}
 	blob.hasHumanOrder = {}
 	blob.willSlot = {}
 	blob.slotted = {}
@@ -266,7 +272,7 @@ local function SortUnits(blob)
 			unit.willSlot = false
 			if unit then
 				local target = unitsByID[unit.targetID]
-				if not unit.constructing and not unit.hasHumanOrder then
+				if not unit.hasHumanOrder and not unit.constructing then
 					if info.isCombatant and info.speed > blob.speed then
 						local gx, gy, gz = Spring.GetUnitPosition(unitID)
 						unit.x, unit.y, unit.z = gx, gy, gz
@@ -292,7 +298,10 @@ local function SortUnits(blob)
 							end
 						end
 					else
-						if unit.angle then blob.needSlotting = true end
+						if unit.angle then
+							blob.needSlotting = true
+							unit.angle = nil
+						end
 						if info.canRepair and #blob.needsRepair > 0 then
 							local repair = true
 							if target then
@@ -314,7 +323,15 @@ local function SortUnits(blob)
 						end
 					end
 				else
+					if unit.angle then
+						blob.needSlotting = true
+						unit.angle = nil
+					end
 					table.insert(blob.hasHumanOrder, unit)
+					-- store order for others of this unit def to follow
+					if interruptCmd[unit.hasHumanOrder.cmdID] then
+						blob.ordersByDef[unitDefID] = unit.hasHumanOrder
+					end
 				end
 			end
 		end
@@ -465,19 +482,24 @@ end
 local function AssignRemaining(blob)
 	if #blob.willGuard == 0 then return end
 	for ui, unit in pairs(blob.willGuard) do
-		local unitID
-		if #blob.hasHumanOrder == 0 then
-			if #blob.willGuard > 1 then
-				for ti = 1, #blob.willGuard do
-					local target = blob.willGuard[ti]
-					if target ~= unit then unitID = target.unitID end
-				end
-			end
+		local order = blob.ordersByDef[unit.unitDefID]
+		if order ~= nil then
+			CloneOrder(unit.unitID, order)
 		else
-			local ti = random(1, #blob.hasHumanOrder)
-			unitID = blob.hasHumanOrder[ti].unitID
+			local unitID
+			if #blob.hasHumanOrder == 0 then
+				if #blob.willGuard > 1 then
+					for ti = 1, #blob.willGuard do
+						local target = blob.willGuard[ti]
+						if target ~= unit then unitID = target.unitID end
+					end
+				end
+			else
+				local ti = random(1, #blob.hasHumanOrder)
+				unitID = blob.hasHumanOrder[ti].unitID
+			end
+			if unitID then GiveCommand(unit.unitID, CMD.GUARD, {unitID}) end
 		end
-		if unitID then GiveCommand(unit.unitID, CMD.GUARD, {unitID}) end
 	end
 end
 
@@ -533,6 +555,10 @@ function widget:UnitIdle(unitID, unitDefID, teamID)
 	unit.hasHumanOrder = nil
 end
 
+function widget:UnitMoveFailed(unitID, unitDefID, unitTeam)
+	widget:UnitIdle(unitID, unitDefID, unitTeam)
+end
+
 function widget:UnitCreated(unitID, unitDefID, teamID, builderID)
 	local unit = unitsByID[builderID]
 	if not unit then return end
@@ -544,7 +570,7 @@ function widget:UnitCreated(unitID, unitDefID, teamID, builderID)
 	else
 		register = true
 	end
-	if register then unit.hasHumanOrder = { cmdID = 99999, cmdParams = { unitID, unitDefID }, cmdOpts = {} } end
+	if register then unit.hasHumanOrder = { cmdID = -unitDefID, cmdParams = { unitID, unitDefID }, cmdOpts = {} } end
 end
 
 function widget:UnitDestroyed(unitID, unitDefID, teamID, attackerID, attackerDefID, attackerTeamID)
@@ -560,6 +586,11 @@ function widget:GameFrame(gameFrame)
 		for unitID, unit in pairs(unitsByID) do
 			local groupID = Spring.GetUnitGroup(unitID)
 			if not groupID then ClearUnit(unitID) end
+			if groupID ~= unit.lastGroupID and unit.angle then
+				blobs[groupID].needSlotting = true
+				unit.angle = nil
+			end
+			unit.lastGroupID = groupID
 		end
 		for groupID, blob in pairs(blobs) do
 			local unitCount = Spring.GetGroupUnitsCount(groupID)
