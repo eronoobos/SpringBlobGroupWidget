@@ -101,17 +101,36 @@ local function AngleDist(angle1, angle2)
 	-- Spring.Echo(math.floor(angleDist * 57.29), math.floor(high * 57.29), math.floor(low * 57.29))
 end
 
-local function GetLongestWeaponRange(unitDef)
-	local weaponRange = 0
+local function GetLongestWeaponInfo(unitDef)
+	local weapon
+	local highestDPS = 0
 	local weapons = unitDef["weapons"]
+	local death = unitDef.deathExplosion
 	for i=1, #weapons do
 		local weaponDefID = weapons[i]["weaponDef"]
 		local weaponDef = WeaponDefs[weaponDefID]
-		if weaponDef["range"] > weaponRange then
-			weaponRange = weaponDef["range"]
+		local damages = weaponDef["damages"]
+		local damage = 0
+		local reload = weaponDef["reload"]
+		for i, d in pairs(damages) do
+			if d > damage then damage = d end
+		end
+		local dps = damage / reload
+		if weaponDef["name"] ~= death and dps > highestDPS then
+			weapon = weaponDef
+			highestDPS = dps
 		end
 	end
-	return weaponRange
+	if weapon then
+		local range = weapon["range"]
+		local reload = weapon["reload"]
+		local velocity = weapon["projectilespeed"] or 0
+		local hightrajectory = weapon["highTrajectory"]
+		local air = not weapon["canAttackGround"]
+		return range, reload, highestDPS, velocity, hightrajectory, air
+	else
+		return 0, 0, 0, 0
+	end
 end
 local function GetUnitDefInfo(defID)
 	if infosByDefID[defID] then return infosByDefID[defID] end
@@ -119,10 +138,10 @@ local function GetUnitDefInfo(defID)
 	local x = uDef.xsize * 8
 	local z = uDef.zsize * 8
 	local size = ceil(Pythagorean(x, z))
-	local range = GetLongestWeaponRange(uDef)
-	local ratio = ((uDef.health * uDef.speed) / uDef.metalCost) / range
-	-- stumpy (1530 * 87 / 201) / 350 = 1.89
-	local isCombatant = ratio > 1 and uDef.canAttack and not uDef.canFly and not uDef.canAssist and not uDef.canRepair
+	local range, reload, dps, velocity, hightrajectory, air = GetLongestWeaponInfo(uDef)
+	local ratio = (((uDef.health / 10) + uDef.speed + dps + (velocity*2)) / uDef.metalCost) - (range * 0.001) - (reload * 0.15)
+	-- Spring.Echo(uDef.humanName, ratio, velocity, hightrajectory, air)
+	local isCombatant = ratio > 0.2 and hightrajectory ~= 1 and not air and uDef.canAttack and not uDef.canFly and not uDef.canAssist and not uDef.canRepair
 	local info = { isCombatant = isCombatant, speed = uDef.speed, size = size, range = range, canMove = uDef.canMove, canAttack = uDef.canAttack, canAssist = uDef.canAssist, canRepair = uDef.canRepair, canFly = uDef.canFly }
 	infosByDefID[defID] = info
 	return info
@@ -190,6 +209,7 @@ local function EvaluateUnits(blob, gameFrame)
 	blob.needsAssist = {}
 	blob.needsRepair = {}
 	blob.humanOrderCount = 0
+	blob.unitCount = 0
 	local interiorUnitCount = 0
 	local maxSizeInterior = 0
 	local minX = 100000
@@ -208,8 +228,8 @@ local function EvaluateUnits(blob, gameFrame)
 			if unit.hasHumanOrder then blob.humanOrderCount = blob.humanOrderCount + 1 end
 			if unit.underFire then
 				-- unit is no longer under fire after 5 seconds
-				if gameFrame > blob.underFire + 150 then blob.underFire = nil end
-				if blob.underFire then
+				if gameFrame > unit.underFire + 150 then unit.underFire = nil end
+				if blob.underFire and unit.underFire then
 					if unit.underFire > blob.underFire then blob.underFire = unit.underFire end
 				else
 					blob.underFire = unit.underFire
@@ -239,6 +259,7 @@ local function EvaluateUnits(blob, gameFrame)
 				if vectorSize > maxVectorSize then maxVectorSize = vectorSize end
 				interiorUnitCount = interiorUnitCount + 1
 			end
+			blob.unitCount = blob.unitCount + 1
 		end
 	end
 	blob.vx = totalVX / interiorUnitCount
@@ -262,6 +283,7 @@ local function SortUnits(blob)
 	blob.willAssist = {}
 	blob.willRepair = {}
 	blob.willGuard = {}
+	local allHumanOrders = blob.humanOrderCount == blob.unitCount
 	local humanOrdersLeft = blob.humanOrderCount + 0
 	local distanceCutOff = blob.radius + (blob.guardDistance * 3)
 	local sortedUnits = Spring.GetGroupUnitsSorted(blob.groupID)
@@ -272,8 +294,9 @@ local function SortUnits(blob)
 			unit.willSlot = false
 			if unit then
 				local target = unitsByID[unit.targetID]
-				if not unit.hasHumanOrder and not unit.constructing then
-					if info.isCombatant and info.speed > blob.speed then
+				local exterior = info.isCombatant and info.speed > blob.speed
+				if not unit.hasHumanOrder and not unit.constructing or (exterior and allHumanOrders) then
+					if exterior then
 						local gx, gy, gz = Spring.GetUnitPosition(unitID)
 						unit.x, unit.y, unit.z = gx, gy, gz
 						-- Spring.Echo(blob.x, blob.z, blob.vx, blob.vz, gx, gz, unitID)
@@ -473,7 +496,9 @@ local function AssignRepair(blob)
 		if ti == #blob.needsRepair then quota = #blob.willRepair end
 		for i = 1, quota do
 			local unit = table.remove(blob.willRepair)
-			GiveCommand(unit.unitID, CMD.REPAIR, {unitID})
+			if unit then
+				GiveCommand(unit.unitID, CMD.REPAIR, {unitID})
+			end
 		end
 		if #blob.willRepair == 0 then break end
 	end
@@ -585,9 +610,11 @@ function widget:GameFrame(gameFrame)
 	if gameFrame % 30 == 0 then
 		for unitID, unit in pairs(unitsByID) do
 			local groupID = Spring.GetUnitGroup(unitID)
-			if not groupID then ClearUnit(unitID) end
-			if groupID ~= unit.lastGroupID and unit.angle then
-				blobs[groupID].needSlotting = true
+			if groupID == nil then
+				ClearUnit(unitID)
+			elseif groupID ~= unit.lastGroupID and unit.angle then
+				local blob = blobs[groupID]
+				if blob then blob.needSlotting = true end
 				unit.angle = nil
 			end
 			unit.lastGroupID = groupID
