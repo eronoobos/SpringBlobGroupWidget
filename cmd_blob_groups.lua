@@ -833,8 +833,14 @@ function widget:DrawWorldPreUnit()
 					radius = blob.radius
 				end
 				local sx, sy, sz = Spring.WorldToScreenCoords(x, y, z)
-				local sx1, sy1, sz1 = Spring.WorldToScreenCoords(x+radius, y, z-radius)
-				local srx = (sx1 - sx)
+				local sx1, sy1, sz1
+				local screenX, screenY = Spring.GetScreenGeometry()
+				if sx < screenX / 2 then
+					sx1, sy1, sz1 = Spring.WorldToScreenCoords(x+radius, y, z-radius)
+				else
+					sx1, sy1, sz1 = Spring.WorldToScreenCoords(x-radius, y, z-radius) -- so it doesn't squish at the right screen edge
+				end
+				local srx = abs(sx1 - sx)
 				local sry = (sy1 - sy)
 				local yRad = (sry / srx) * radius
 				gl.Translate(x,y,z)
