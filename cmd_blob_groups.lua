@@ -39,6 +39,8 @@ local widgetCommands = {}
 local lastCalcFrame = 0
 local blobCount = 0
 
+local circleTex = "LuaUI/Images/blobguard/circle.png"
+
 local sizeX = Game.mapSizeX
 local sizeZ = Game.mapSizeZ
 local bufferedSizeX = sizeX - mapBuffer
@@ -101,6 +103,12 @@ local function AngleDist(angle1, angle2)
 	-- Spring.Echo(math.floor(angleDist * 57.29), math.floor(high * 57.29), math.floor(low * 57.29))
 end
 
+local function AngleAtoB(x1, z1, x2, z2)
+	local dx = x2 - x1
+	local dz = z2 - z1
+	return atan2(-dz, dx)
+end
+
 local function GetLongestWeaponInfo(unitDef)
 	local weapon
 	local highestDPS = 0
@@ -145,6 +153,22 @@ local function GetUnitDefInfo(defID)
 	local info = { isCombatant = isCombatant, speed = uDef.speed, size = size, range = range, canMove = uDef.canMove, canAttack = uDef.canAttack, canAssist = uDef.canAssist, canRepair = uDef.canRepair, canFly = uDef.canFly }
 	infosByDefID[defID] = info
 	return info
+end
+
+local function SameCommands(cmd1, cmd2)
+	if cmd1.cmdID == cmd2.cmdID then
+		local paramsMatch = true
+		for pi, param in pairs(cmd1.cmdParams) do
+			if cmd2.cmdParams[pi] ~= param then
+				paramsMatch = false
+				break
+			end
+		end
+		if paramsMatch then
+			return true
+		end
+	end
+	return false
 end
 
 local function GiveCommand(unitID, cmdID, cmdParams)
@@ -210,6 +234,8 @@ local function EvaluateUnits(blob, gameFrame)
 	blob.needsRepair = {}
 	blob.humanOrderCount = 0
 	blob.unitCount = 0
+	local firstOrder
+	local ordersAgree = true
 	local interiorUnitCount = 0
 	local maxSizeInterior = 0
 	local minX = 100000
@@ -221,11 +247,29 @@ local function EvaluateUnits(blob, gameFrame)
 	local maxVectorSize = 0
 	local groupID = blob.groupID
 	local sortedUnits = Spring.GetGroupUnitsSorted(blob.groupID)
+	-- first just check if there are any noncombatants at all
+	blob.hasNoncombatants = false
+	for unitDefID, units in pairs(sortedUnits) do
+		local info = GetUnitDefInfo(unitDefID)
+		if not info.isCombatant then
+			blob.hasNoncombatants = true
+			break
+		end
+	end
 	for unitDefID, units in pairs(sortedUnits) do
 		local info = GetUnitDefInfo(unitDefID)
 		for i, unitID in pairs(units) do
 			local unit = unitsByID[unitID] or CreateUnit(unitID)
-			if unit.hasHumanOrder then blob.humanOrderCount = blob.humanOrderCount + 1 end
+			if unit.humanOrder then
+				blob.humanOrderCount = blob.humanOrderCount + 1
+				if ordersAgree then
+					if not firstOrder then
+						firstOrder = unit.humanOrder
+					elseif not SameCommands(firstOrder, unit.humanOrder) then
+						ordersAgree = false
+					end
+				end
+			end
 			if unit.underFire then
 				-- unit is no longer under fire after 5 seconds
 				if gameFrame > unit.underFire + 150 then unit.underFire = nil end
@@ -242,10 +286,11 @@ local function EvaluateUnits(blob, gameFrame)
 			local health, maxHealth = Spring.GetUnitHealth(unitID)
 			unit.damaged = health < maxHealth
 			if unit.damaged then table.insert(blob.needsRepair, unitID) end
-			if unit.angle or unit.willSlot or (info.isCombatant and info.speed > blob.speed) then
-
+			local probablyWillSlot = info.isCombatant and info.speed > blob.speed
+			if blob.hasNoncombatants and (unit.angle or unit.willSlot or probablyWillSlot) then
+				-- for units on the exterior
 			else
-				-- for units on the interior currently
+				-- for units on the interior
 				if info.size > maxSizeInterior then maxSizeInterior = info.size end
 				local ux, uy, uz = Spring.GetUnitPosition(unitID)
 				if ux > maxX then maxX = ux end
@@ -264,6 +309,7 @@ local function EvaluateUnits(blob, gameFrame)
 	end
 	blob.vx = totalVX / interiorUnitCount
 	blob.vz = totalVZ / interiorUnitCount
+	blob.vectorAngle = atan2(-blob.vz, blob.vx)
 	blob.speed = maxVectorSize * 30
 	local dx = maxX - minX
 	local dz = maxZ - minZ
@@ -273,6 +319,21 @@ local function EvaluateUnits(blob, gameFrame)
 	blob.preVectorX, blob.preVectorZ = blob.x, blob.z
 	blob.x, blob.z = ApplyVector(blob.x, blob.z, blob.vx, blob.vz)
 	blob.y = Spring.GetGroundHeight(blob.x, blob.z)
+	-- get blob target from orders given
+	if ordersAgree and firstOrder then
+		blob.humanOrder = firstOrder
+		local tx, ty, tz
+		local cmdParams = blob.humanOrder.cmdParams
+		if #cmdParams == 1 then
+			tx, ty, tz = Spring.GetUnitPosition(cmdParams[1])
+		elseif #cmdParams == 3 or #cmdParams == 4 then
+			tx, ty, tz = cmdParams[1], cmdParams[2], cmdParams[3]
+		end
+		blob.tx, blob.ty, blob.tz = tx, ty, tz
+		blob.targetDistance = Distance(blob.x, blob.z, tx, tz)
+	else
+		blob.tx, blob.ty, blob.tz, blob.targetDistance = nil, nil, nil, nil
+	end
 end
 
 local function SortUnits(blob)
@@ -283,8 +344,8 @@ local function SortUnits(blob)
 	blob.willAssist = {}
 	blob.willRepair = {}
 	blob.willGuard = {}
-	local allHumanOrders = blob.humanOrderCount == blob.unitCount
-	local humanOrdersLeft = blob.humanOrderCount + 0
+	blob.willWait = {}
+	blob.willResume = {}
 	local distanceCutOff = blob.radius + (blob.guardDistance * 3)
 	local sortedUnits = Spring.GetGroupUnitsSorted(blob.groupID)
 	for unitDefID, units in pairs(sortedUnits) do
@@ -294,8 +355,8 @@ local function SortUnits(blob)
 			unit.willSlot = false
 			if unit then
 				local target = unitsByID[unit.targetID]
-				local exterior = info.isCombatant and info.speed > blob.speed
-				if not unit.hasHumanOrder and not unit.constructing or (exterior and allHumanOrders) then
+				local exterior = blob.hasNoncombatants and info.isCombatant and info.speed > blob.speed
+				if (not unit.humanOrder and not unit.constructing) or (exterior and blob.humanOrder) then
 					if exterior then
 						local gx, gy, gz = Spring.GetUnitPosition(unitID)
 						unit.x, unit.y, unit.z = gx, gy, gz
@@ -350,10 +411,37 @@ local function SortUnits(blob)
 						blob.needSlotting = true
 						unit.angle = nil
 					end
-					table.insert(blob.hasHumanOrder, unit)
-					-- store order for others of this unit def to follow
-					if interruptCmd[unit.hasHumanOrder.cmdID] then
-						blob.ordersByDef[unitDefID] = unit.hasHumanOrder
+					if unit.humanOrder then
+						local stop = false
+						if blob.tx then
+							-- check if unit needs to stop to wait for others to catch up
+							-- or if it needs to resume after waiting
+							local x, y, z = Spring.GetUnitPosition(unit.unitID)
+							unit.x, unit.y, unit.z = x, y, z
+							local dist = Distance(blob.tx, blob.tz, x, z)
+							if dist < blob.targetDistance * 0.95 then
+								stop = true
+							end
+						end
+						if stop then
+							if not unit.stopped then
+								table.insert(blob.willWait, unit)
+							end
+						else
+							if unit.stopped then
+								if SameCommands(unit.humanOrder, blob.humanOrder) then
+									table.insert(blob.willResume, unit)
+								else
+									unit.stopped = false
+									unit.humanOrder = nil
+								end
+							end
+						end
+						table.insert(blob.hasHumanOrder, unit)
+						-- store order for others of this unit def to follow
+						if interruptCmd[unit.humanOrder.cmdID] then
+							blob.ordersByDef[unitDefID] = unit.humanOrder
+						end
 					end
 				end
 			end
@@ -398,7 +486,7 @@ local function AssignCombat(blob)
 			angleAdd = twicePi / divisor
 			if divisor < 3 and (blob.speed > 0) then 
 				 -- one or two guards should unit in front of unit first
-				angle = atan2(-blob.vz, blob.vx)
+				angle = blob.vectorAngle
 				blob.lastAngle = angle
 			elseif blob.lastAngle then
 				angle = blob.lastAngle
@@ -504,6 +592,21 @@ local function AssignRepair(blob)
 	end
 end
 
+local function AssignWait(blob)
+	for ui, unit in pairs(blob.willWait) do
+		GiveCommand(unit.unitID, CMD.STOP, {})
+		unit.stopped = true
+	end
+end
+
+local function AssignResume(blob)
+	for ui, unit in pairs(blob.willResume) do
+		CloneOrder(unit.unitID, unit.humanOrder)
+		unit.stopped = false
+	end
+end
+
+
 local function AssignRemaining(blob)
 	if #blob.willGuard == 0 then return end
 	for ui, unit in pairs(blob.willGuard) do
@@ -527,7 +630,6 @@ local function AssignRemaining(blob)
 		end
 	end
 end
-
 
 
 -- SPRING CALLINS
@@ -571,13 +673,14 @@ function widget:UnitCommand(unitID, unitDefID, unitTeam, cmdID, cmdOpts, cmdPara
 		end
 	end
 	-- below is not a widget command
-	unit.hasHumanOrder = { cmdID = cmdID, cmdParams = cmdParams, cmdOpts = cmdOpts }
+	unit.humanOrder = { cmdID = cmdID, cmdParams = cmdParams, cmdOpts = cmdOpts }
+	unit.stopped = false
 end
 
 function widget:UnitIdle(unitID, unitDefID, teamID)
 	local unit = unitsByID[unitID]
 	if not unit then return end
-	unit.hasHumanOrder = nil
+	if not unit.stopped then unit.humanOrder = nil end
 end
 
 function widget:UnitMoveFailed(unitID, unitDefID, unitTeam)
@@ -588,14 +691,14 @@ function widget:UnitCreated(unitID, unitDefID, teamID, builderID)
 	local unit = unitsByID[builderID]
 	if not unit then return end
 	local register = false
-	if unit.hasHumanOrder then
-		if unit.hasHumanOrder.cmdID ~= -unitDefID then
+	if unit.humanOrder then
+		if unit.humanOrder.cmdID ~= -unitDefID then
 			register = true
 		end
 	else
 		register = true
 	end
-	if register then unit.hasHumanOrder = { cmdID = -unitDefID, cmdParams = { unitID, unitDefID }, cmdOpts = {} } end
+	if register then unit.humanOrder = { cmdID = -unitDefID, cmdParams = { unitID, unitDefID }, cmdOpts = {} } end
 end
 
 function widget:UnitDestroyed(unitID, unitDefID, teamID, attackerID, attackerDefID, attackerTeamID)
@@ -631,6 +734,8 @@ function widget:GameFrame(gameFrame)
 				AssignCombat(blob) -- put combatant guards into circle slots
 				AssignAssist(blob)
 				AssignRepair(blob)
+				AssignWait(blob)
+				AssignResume(blob)
 				AssignRemaining(blob)
 				blob.lastVX = blob.vx
 				blob.lastVZ = blob.vz
@@ -658,9 +763,9 @@ function widget:DrawWorldPreUnit()
 	local framesSince = gameFrame - lastCalcFrame
 	local divisor = 60 - framesSince
 	gl.PushMatrix()
-	gl.DepthTest(true)
-	gl.LineWidth(3)
-	gl.Color(0, 0, 1, 0.33)
+	-- gl.DepthTest(true)
+	gl.Texture(circleTex)
+	gl.Color(0, 0, 1, 0.25)
 	for groupID, blob in pairs(blobs) do
 		if blob.x and blob.vx and blob.radius then
 			if Spring.IsSphereInView(blob.x, blob.y, blob.z, blob.radius) then
@@ -687,13 +792,21 @@ function widget:DrawWorldPreUnit()
 				else
 					radius = blob.radius
 				end
-				gl.DrawGroundCircle(x, y, z, radius, 8)
+				local sx, sy, sz = Spring.WorldToScreenCoords(x, y, z)
+				local sx1, sy1, sz1 = Spring.WorldToScreenCoords(x+radius, y, z-radius)
+				local srx = (sx1 - sx)
+				local sry = (sy1 - sy)
+				local yRad = (sry / srx) * radius
+				gl.Translate(x,y,z)
+				gl.Billboard()			
+				gl.TexRect(-radius,-yRad,radius,yRad)
 				blob.displayRadius = radius
 				blob.displayX, blob.displayZ = x, z
 				blob.lastDrawFrame = gameFrame
 			end
 		end
 	end
-	gl.DepthTest(false)
+	gl.Texture(false)
+	-- gl.DepthTest(false)
 	gl.PopMatrix()
 end
