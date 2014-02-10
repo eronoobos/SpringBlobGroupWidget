@@ -40,7 +40,7 @@ local widgetCommands = {}
 local lastCalcFrame = 0
 local blobCount = 0
 
-local circleTex = "LuaUI/Images/blobguard/circle.png"
+local circleTex = "LuaUI/Images/blobgroups/circle.png"
 
 local sizeX = Game.mapSizeX
 local sizeZ = Game.mapSizeZ
