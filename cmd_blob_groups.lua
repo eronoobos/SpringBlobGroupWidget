@@ -31,6 +31,7 @@ local ceil = math.ceil
 local drawIndicators = true
 local mapBuffer = 32
 
+local myTeam
 local blobs = {}
 local groupsByID = {}
 local unitsByID = {}
@@ -151,7 +152,7 @@ local function GetUnitDefInfo(defID)
 	local ratio = (((uDef.health / 10) + uDef.speed + dps + (velocity*2)) / uDef.metalCost) - (range * 0.001) - (reload * 0.15)
 	-- Spring.Echo(uDef.humanName, ratio, velocity, hightrajectory, air)
 	local isCombatant = ratio > 0.2 and hightrajectory ~= 1 and not air and uDef.canAttack and not uDef.canFly and not uDef.canAssist and not uDef.canRepair
-	local info = { isBuilder = #uDef.buildOptions ~= 0, isCombatant = isCombatant, speed = uDef.speed, size = size, area = area, range = range, canMove = uDef.canMove, canAttack = uDef.canAttack, canAssist = uDef.canAssist, canRepair = uDef.canRepair, canFly = uDef.canFly }
+	local info = { isBuilder = #uDef.buildOptions ~= 0, isCombatant = isCombatant, speed = uDef.speed, size = size, area = area, range = range, canReclaim = uDef.canReclaim, canResurrect = uDef.canResurrect, canMove = uDef.canMove, canAttack = uDef.canAttack, canAssist = uDef.canAssist, canRepair = uDef.canRepair, canFly = uDef.canFly }
 	infosByDefID[defID] = info
 	return info
 end
@@ -233,6 +234,8 @@ end
 local function EvaluateUnits(blob, gameFrame)
 	blob.needsAssist = {}
 	blob.needsRepair = {}
+	blob.needsResurrectAssist = {}
+	blob.needsReclaimAssist = {}
 	blob.humanOrderCount = 0
 	blob.unitCount = 0
 	blob.lowestInteriorSpeed = 0
@@ -284,20 +287,47 @@ local function EvaluateUnits(blob, gameFrame)
 				end
 			end
 			if info.isBuilder then
-				unit.constructing = nil
+				unit.constructionOrder = nil
+				unit.constructing = Spring.GetUnitIsBuilding(unitID)
 				if unit.humanOrder then
-					if unit.humanOrder.cmdID < 0 then unit.constructing = true end
+					if unit.humanOrder.cmdID < 0 then unit.constructionOrder = -unit.humanOrder.cmdID end
 				end
-				if not unit.constructing then unit.constructing = Spring.GetUnitIsBuilding(unitID) end
-				if unit.constructing then table.insert(blob.needsAssist, unitID) end
+				if unit.constructing or unit.constructionOrder then table.insert(blob.needsAssist, unitID) end
+			end
+			if info.canResurect then
+				unit.resurrecting = nil
+				if unit.humanOrder then
+					unit.resurrecting = unit.humanOrder.cmdID == CMD.RECLAIM
+				else
+					local cmdQueue = Spring.GetUnitCommands(unit.unitID, 1)
+					if cmdQueue[1] then
+						if cmdQueue[1].id == CMD.RESURRECT then unit.resurrecting = true end
+					end
+				end
+				if unit.resurrecting then table.insert(blob.needsResurrectAssist, unitID) end
+			end
+			if info.canReclaim then
+				unit.reclaiming = nil
+				if unit.humanOrder then
+					unit.reclaiming = unit.humanOrder.cmdID == CMD.RECLAIM
+				else
+					local cmdQueue = Spring.GetUnitCommands(unit.unitID, 1)
+					if cmdQueue[1] then
+						if cmdQueue[1].id == CMD.RECLAIM then unit.reclaiming = true end
+					end
+				end
+				if unit.reclaiming then table.insert(blob.needsReclaimAssist, unitID) end
 			end
 			local health, maxHealth = Spring.GetUnitHealth(unitID)
 			unit.damaged = health < maxHealth
 			if unit.damaged then table.insert(blob.needsRepair, unitID) end
 			local probablyWillSlot = info.isCombatant and info.speed > blob.speed
+			local exteriorTarget
+			local target = unitsByID[unit.targetID]
+			if target then exteriorTarget = target.angle end
 			if blob.hasNoncombatants and not unit.interiorize and (unit.angle or unit.willSlot or probablyWillSlot) then
 				-- for units on the exterior
-			else
+			elseif not exteriorTarget then
 				-- for units on the interior
 				if info.size > maxSizeInterior then maxSizeInterior = info.size end
 				if info.speed < minSpeedInterior then minSpeedInterior = info.speed end
@@ -347,6 +377,7 @@ local function EvaluateUnits(blob, gameFrame)
 	else
 		blob.tx, blob.ty, blob.tz, blob.targetDistance = nil, nil, nil, nil
 	end
+	if blob.humanOrderCount == 0 then blob.humanOrder = nil end
 end
 
 local function SortUnits(blob)
@@ -356,6 +387,8 @@ local function SortUnits(blob)
 	blob.slotted = {}
 	blob.willAssist = {}
 	blob.willRepair = {}
+	blob.willResurrectAssist = {}
+	blob.willReclaimAssist = {}
 	blob.willGuard = {}
 	blob.willWait = {}
 	blob.willResume = {}
@@ -418,6 +451,18 @@ local function SortUnits(blob)
 								if target.constructing then assist = false end
 							end
 							if assist then table.insert(blob.willAssist, unit) end
+						elseif info.canResurrect and #blob.needsResurrectAssist > 0 then
+							local assist = true
+							if target then
+								if target.resurrecting then assist = false end
+							end
+							if assist then table.insert(blob.willResurrectAssist, unit) end
+						elseif info.canReclaim and #blob.needsReclaimAssist > 0 then
+							local assist = true
+							if target then
+								if target.reclaiming then assist = false end
+							end
+							if assist then table.insert(blob.willReclaimAssist, unit) end
 						else
 							if not target then
 								table.insert(blob.willGuard, unit)
@@ -593,39 +638,45 @@ end
 
 local function AssignAssist(blob)
 	if #blob.needsAssist == 0 or #blob.willAssist == 0 then return end
-	local quota = 1
-	if #blob.needsAssist == 1 then
-		quota = #blob.willAssist
-	else
-		quota = math.floor(#blob.needsAssist / #blob.willAssist)
-	end
-	for ti, unitID in pairs(blob.needsAssist) do
-		if ti == #blob.needsAssist then quota = #blob.willAssist end
-		for i = 1, quota do
+	while #blob.willAssist > 0 do
+		for ti, unitID in pairs(blob.needsAssist) do
 			local unit = table.remove(blob.willAssist)
 			GiveCommand(unit.unitID, CMD.GUARD, {unitID})
+			if #blob.willAssist == 0 then break end
 		end
-		if #blob.willAssist == 0 then break end
 	end
 end
 
 local function AssignRepair(blob)
 	if #blob.needsRepair == 0 or #blob.willRepair == 0 then return end
-	local quota = 1
-	if #blob.needsRepair == 1 then
-		quota = #blob.willRepair
-	else
-		quota = math.floor(#blob.needsRepair / #blob.willRepair)
-	end
-	for ti, unitID in pairs(blob.needsRepair) do
-		if ti == #blob.needsRepair then quota = #blob.willRepair end
-		for i = 1, quota do
+	while #blob.willRepair > 0 do
+		for ti, unitID in pairs(blob.needsRepair) do
 			local unit = table.remove(blob.willRepair)
-			if unit then
-				GiveCommand(unit.unitID, CMD.REPAIR, {unitID})
-			end
+			GiveCommand(unit.unitID, CMD.GUARD, {unitID})
+			if #blob.willRepair == 0 then break end
 		end
-		if #blob.willRepair == 0 then break end
+	end
+end
+
+local function AssignResurrectAssist(blob)
+	if #blob.needsResurrectAssist == 0 or #blob.willResurrectAssist == 0 then return end
+	while #blob.willResurrectAssist > 0 do
+		for ti, unitID in pairs(blob.needsResurrectAssist) do
+			local unit = table.remove(blob.willResurrectAssist)
+			GiveCommand(unit.unitID, CMD.GUARD, {unitID})
+			if #blob.willResurrectAssist == 0 then break end
+		end
+	end
+end
+
+local function AssignReclaimAssist(blob)
+	if #blob.needsReclaimAssist == 0 or #blob.willReclaimAssist == 0 then return end
+	while #blob.willReclaimAssist > 0 do
+		for ti, unitID in pairs(blob.needsReclaimAssist) do
+			local unit = table.remove(blob.willReclaimAssist)
+			GiveCommand(unit.unitID, CMD.GUARD, {unitID})
+			if #blob.willReclaimAssist == 0 then break end
+		end
 	end
 end
 
@@ -646,27 +697,48 @@ end
 
 local function AssignRemaining(blob)
 	if #blob.willGuard == 0 then return end
+	Spring.Echo(blob.humanOrder, blob.humanOrderCount)
 	for ui, unit in pairs(blob.willGuard) do
-		local order = blob.ordersByDef[unit.unitDefID]
-		if order ~= nil then
-			CloneOrder(unit.unitID, order)
+		if blob.humanOrderCount == 0 and not blob.humanOrder then
+			local info = infosByDefID[unit.unitDefID]
+			local metalLevel, metalStorage
+			if info.canResurrect or info.canReclaim then metalLevel, metalStorage = Spring.GetTeamResources(myTeam, "metal") end
+			if info.canResurrect and not unit.resurrecting then
+				if metalLevel > metalStorage * 0.5 then
+					Spring.Echo("give resurrect")
+					GiveCommand(unit.unitID, CMD.RESURRECT, {blob.x, blob.y, blob.z, blob.radius+blob.guardDistance})
+				end
+			elseif info.canReclaim and not unit.reclaiming then
+				if metalLevel < metalStorage * 0.5 then
+					GiveCommand(unit.unitID, CMD.RECLAIM, {blob.x, blob.y, blob.z, blob.radius+blob.guardDistance})
+				end
+			elseif info.canRepair then
+				GiveCommand(unit.unitID, CMD.REPAIR, {blob.x, blob.y, blob.z, blob.radius+blob.guardDistance})
+			elseif info.canAssist then
+				GiveCommand(unit.unitID, CMD.FIGHT, {blob.x, blob.y, blob.z})
+			end
 		else
-			local unitID
-			if #blob.hasHumanOrder == 0 then
-				if #blob.willGuard > 1 then
-					for ti = 1, #blob.willGuard do
-						local target = blob.willGuard[ti]
-						if target ~= unit then
-							unitID = target.unitID
-							break
+			local order = blob.ordersByDef[unit.unitDefID]
+			if order ~= nil then
+				CloneOrder(unit.unitID, order)
+			else
+				local unitID
+				if #blob.hasHumanOrder == 0 then
+					if #blob.willGuard > 1 then
+						for ti = 1, #blob.willGuard do
+							local target = blob.willGuard[ti]
+							if target ~= unit then
+								unitID = target.unitID
+								break
+							end
 						end
 					end
+				else
+					local ti = random(1, #blob.hasHumanOrder)
+					unitID = blob.hasHumanOrder[ti].unitID
 				end
-			else
-				local ti = random(1, #blob.hasHumanOrder)
-				unitID = blob.hasHumanOrder[ti].unitID
+				if unitID then GiveCommand(unit.unitID, CMD.GUARD, {unitID}) end
 			end
-			if unitID then GiveCommand(unit.unitID, CMD.GUARD, {unitID}) end
 		end
 	end
 end
@@ -675,6 +747,7 @@ end
 -- SPRING CALLINS
 
 function widget:Initialize()
+	myTeam = Spring.GetMyTeamID()
 	-- make sure we start with all the groups registered
 	local groups = Spring.GetGroupList()
 	for groupID, unitCount in pairs(groups) do
@@ -731,6 +804,7 @@ function widget:UnitCreated(unitID, unitDefID, teamID, builderID)
 	local unit = unitsByID[builderID]
 	if not unit then return end
 	local register = false
+	unit.constructing = true
 	if unit.humanOrder then
 		if unit.humanOrder.cmdID ~= -unitDefID then
 			register = true
@@ -774,6 +848,8 @@ function widget:GameFrame(gameFrame)
 				AssignCombat(blob) -- put combatant guards into circle slots
 				AssignAssist(blob)
 				AssignRepair(blob)
+				AssignResurrectAssist(blob)
+				AssignReclaimAssist(blob)
 				AssignWait(blob)
 				AssignResume(blob)
 				AssignRemaining(blob)
