@@ -802,7 +802,6 @@ function widget:DrawWorldPreUnit()
 	local gameFrame = Spring.GetGameFrame()
 	local framesSince = gameFrame - lastCalcFrame
 	local divisor = 60 - framesSince
-	gl.PushMatrix()
 	-- gl.DepthTest(true)
 	gl.Texture(circleTex)
 	gl.Color(0, 0, 1, 0.25)
@@ -843,9 +842,11 @@ function widget:DrawWorldPreUnit()
 				local srx = abs(sx1 - sx)
 				local sry = (sy1 - sy)
 				local yRad = (sry / srx) * radius
+				gl.PushMatrix()
 				gl.Translate(x,y,z)
 				gl.Billboard()			
 				gl.TexRect(-radius,-yRad,radius,yRad)
+				gl.PopMatrix()
 				blob.displayRadius = radius
 				blob.displayX, blob.displayZ = x, z
 				blob.lastDrawFrame = gameFrame
@@ -854,5 +855,4 @@ function widget:DrawWorldPreUnit()
 	end
 	gl.Texture(false)
 	-- gl.DepthTest(false)
-	gl.PopMatrix()
 end
