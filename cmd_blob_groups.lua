@@ -697,7 +697,6 @@ end
 
 local function AssignRemaining(blob)
 	if #blob.willGuard == 0 then return end
-	Spring.Echo(blob.humanOrder, blob.humanOrderCount)
 	for ui, unit in pairs(blob.willGuard) do
 		if blob.humanOrderCount == 0 and not blob.humanOrder then
 			local info = infosByDefID[unit.unitDefID]
@@ -705,7 +704,6 @@ local function AssignRemaining(blob)
 			if info.canResurrect or info.canReclaim then metalLevel, metalStorage = Spring.GetTeamResources(myTeam, "metal") end
 			if info.canResurrect and not unit.resurrecting then
 				if metalLevel > metalStorage * 0.5 then
-					Spring.Echo("give resurrect")
 					GiveCommand(unit.unitID, CMD.RESURRECT, {blob.x, blob.y, blob.z, blob.radius+blob.guardDistance})
 				end
 			elseif info.canReclaim and not unit.reclaiming then
