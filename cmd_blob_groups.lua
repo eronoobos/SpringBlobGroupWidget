@@ -146,11 +146,12 @@ local function GetUnitDefInfo(defID)
 	local x = uDef.xsize * 8
 	local z = uDef.zsize * 8
 	local size = ceil(Pythagorean(x, z))
+	local area = x * z
 	local range, reload, dps, velocity, hightrajectory, air = GetLongestWeaponInfo(uDef)
 	local ratio = (((uDef.health / 10) + uDef.speed + dps + (velocity*2)) / uDef.metalCost) - (range * 0.001) - (reload * 0.15)
 	-- Spring.Echo(uDef.humanName, ratio, velocity, hightrajectory, air)
 	local isCombatant = ratio > 0.2 and hightrajectory ~= 1 and not air and uDef.canAttack and not uDef.canFly and not uDef.canAssist and not uDef.canRepair
-	local info = { isCombatant = isCombatant, speed = uDef.speed, size = size, range = range, canMove = uDef.canMove, canAttack = uDef.canAttack, canAssist = uDef.canAssist, canRepair = uDef.canRepair, canFly = uDef.canFly }
+	local info = { isBuilder = #uDef.buildOptions ~= 0, isCombatant = isCombatant, speed = uDef.speed, size = size, area = area, range = range, canMove = uDef.canMove, canAttack = uDef.canAttack, canAssist = uDef.canAssist, canRepair = uDef.canRepair, canFly = uDef.canFly }
 	infosByDefID[defID] = info
 	return info
 end
@@ -234,10 +235,13 @@ local function EvaluateUnits(blob, gameFrame)
 	blob.needsRepair = {}
 	blob.humanOrderCount = 0
 	blob.unitCount = 0
+	blob.lowestInteriorSpeed = 0
+	blob.interiorArea = 0
 	local firstOrder
 	local ordersAgree = true
 	local interiorUnitCount = 0
 	local maxSizeInterior = 0
+	local minSpeedInterior = 1000
 	local minX = 100000
 	local maxX = -100000
 	local minZ = 100000
@@ -280,18 +284,24 @@ local function EvaluateUnits(blob, gameFrame)
 				end
 			end
 			if info.isBuilder then
-				unit.constructing = Spring.GetUnitIsBuilding(unitID)
+				unit.constructing = nil
+				if unit.humanOrder then
+					if unit.humanOrder.cmdID < 0 then unit.constructing = true end
+				end
+				if not unit.constructing then unit.constructing = Spring.GetUnitIsBuilding(unitID) end
 				if unit.constructing then table.insert(blob.needsAssist, unitID) end
 			end
 			local health, maxHealth = Spring.GetUnitHealth(unitID)
 			unit.damaged = health < maxHealth
 			if unit.damaged then table.insert(blob.needsRepair, unitID) end
 			local probablyWillSlot = info.isCombatant and info.speed > blob.speed
-			if blob.hasNoncombatants and (unit.angle or unit.willSlot or probablyWillSlot) then
+			if blob.hasNoncombatants and not unit.interiorize and (unit.angle or unit.willSlot or probablyWillSlot) then
 				-- for units on the exterior
 			else
 				-- for units on the interior
 				if info.size > maxSizeInterior then maxSizeInterior = info.size end
+				if info.speed < minSpeedInterior then minSpeedInterior = info.speed end
+				blob.interiorArea = blob.interiorArea + info.area
 				local ux, uy, uz = Spring.GetUnitPosition(unitID)
 				if ux > maxX then maxX = ux end
 				if ux < minX then minX = ux end
@@ -305,12 +315,15 @@ local function EvaluateUnits(blob, gameFrame)
 				interiorUnitCount = interiorUnitCount + 1
 			end
 			blob.unitCount = blob.unitCount + 1
+			unit.interiorize = nil
 		end
 	end
+	blob.idealRadius = sqrt(blob.interiorArea / pi)
 	blob.vx = totalVX / interiorUnitCount
 	blob.vz = totalVZ / interiorUnitCount
 	blob.vectorAngle = atan2(-blob.vz, blob.vx)
 	blob.speed = maxVectorSize * 30
+	blob.lowestInteriorSpeed = minSpeedInterior
 	local dx = maxX - minX
 	local dz = maxZ - minZ
 	blob.radius = (Pythagorean(dx, dz) / 2) + (maxSizeInterior / 2)
@@ -320,7 +333,7 @@ local function EvaluateUnits(blob, gameFrame)
 	blob.x, blob.z = ApplyVector(blob.x, blob.z, blob.vx, blob.vz)
 	blob.y = Spring.GetGroundHeight(blob.x, blob.z)
 	-- get blob target from orders given
-	if ordersAgree and firstOrder then
+	if ordersAgree and firstOrder and blob.humanOrderCount > 1 then
 		blob.humanOrder = firstOrder
 		local tx, ty, tz
 		local cmdParams = blob.humanOrder.cmdParams
@@ -346,7 +359,9 @@ local function SortUnits(blob)
 	blob.willGuard = {}
 	blob.willWait = {}
 	blob.willResume = {}
+	local humanOrdersLeft = blob.humanOrderCount + 0
 	local distanceCutOff = blob.radius + (blob.guardDistance * 3)
+	local waitDistance = blob.idealRadius
 	local sortedUnits = Spring.GetGroupUnitsSorted(blob.groupID)
 	for unitDefID, units in pairs(sortedUnits) do
 		local info = GetUnitDefInfo(unitDefID)
@@ -355,15 +370,20 @@ local function SortUnits(blob)
 			unit.willSlot = false
 			if unit then
 				local target = unitsByID[unit.targetID]
-				local exterior = blob.hasNoncombatants and info.isCombatant and info.speed > blob.speed
-				if (not unit.humanOrder and not unit.constructing) or (exterior and blob.humanOrder) then
+				unit.interiorize = unit.humanOrder and humanOrdersLeft <= 1
+				local exterior = blob.hasNoncombatants and info.isCombatant and info.speed > blob.speed and not unit.interiorize
+				if (not unit.humanOrder and not unit.constructing) or (exterior and blob.humanOrder and humanOrdersLeft > 1) then
 					if exterior then
+						if unit.humanOrder then
+							humanOrdersLeft = humanOrdersLeft - 1
+							unit.humanOrder = nil
+						end
 						local gx, gy, gz = Spring.GetUnitPosition(unitID)
 						unit.x, unit.y, unit.z = gx, gy, gz
 						-- Spring.Echo(blob.x, blob.z, blob.vx, blob.vz, gx, gz, unitID)
 						local dist = Distance(blob.x, blob.z, gx, gz)
 						if dist > distanceCutOff then
-							if not target then table.insert(blob.willGuard, unit) end
+							table.insert(blob.willGuard, unit)
 							SetMoveState(unit, 0)
 							if unit.angle then blob.needSlotting = true end
 							unit.angle = nil
@@ -412,35 +432,48 @@ local function SortUnits(blob)
 						unit.angle = nil
 					end
 					if unit.humanOrder then
-						local stop = false
-						if blob.tx then
-							-- check if unit needs to stop to wait for others to catch up
-							-- or if it needs to resume after waiting
-							local x, y, z = Spring.GetUnitPosition(unit.unitID)
-							unit.x, unit.y, unit.z = x, y, z
-							local dist = Distance(blob.tx, blob.tz, x, z)
-							if dist < blob.targetDistance * 0.95 then
-								stop = true
-							end
-						end
-						if stop then
-							if not unit.stopped then
-								table.insert(blob.willWait, unit)
-							end
-						else
-							if unit.stopped then
-								if SameCommands(unit.humanOrder, blob.humanOrder) then
-									table.insert(blob.willResume, unit)
-								else
-									unit.stopped = false
-									unit.humanOrder = nil
-								end
-							end
-						end
-						table.insert(blob.hasHumanOrder, unit)
 						-- store order for others of this unit def to follow
 						if interruptCmd[unit.humanOrder.cmdID] then
 							blob.ordersByDef[unitDefID] = unit.humanOrder
+						end
+						if info.isCombatant and info.speed > blob.lowestInteriorSpeed then
+							-- make fast combat units wait for others if necessary
+							local stop = false
+							if blob.tx and blob.humanOrder then
+								-- check if unit needs to stop to wait for others to catch up
+								-- or if it needs to resume after waiting
+								local x, y, z = Spring.GetUnitPosition(unit.unitID)
+								unit.x, unit.y, unit.z = x, y, z
+								local dist = Distance(blob.tx, blob.tz, x, z)
+								if dist < blob.targetDistance - waitDistance then
+									stop = true
+								end
+							end
+							if stop then
+								if not unit.stopped then
+									table.insert(blob.willWait, unit)
+								end
+								table.insert(blob.hasHumanOrder, unit)
+							else
+								if unit.stopped then
+									if SameCommands(unit.humanOrder, blob.humanOrder) then
+										table.insert(blob.willResume, unit)
+										table.insert(blob.hasHumanOrder, unit)
+									else
+										table.insert(blob.willGuard, unit)
+										unit.stopped = nil
+										unit.humanOrder = nil
+									end
+								else
+									table.insert(blob.hasHumanOrder, unit)
+								end
+							end
+						elseif blob.tx and blob.humanOrder and humanOrdersLeft > 1 and info.speed > blob.lowestInteriorSpeed then
+							table.insert(blob.willGuard, unit)
+							unit.humanOrder = nil
+							humanOrdersLeft = humanOrdersLeft - 1
+						else
+							table.insert(blob.hasHumanOrder, unit)
 						end
 					end
 				end
@@ -484,7 +517,7 @@ local function AssignCombat(blob)
 		if blob.needSlotting then
 			-- if we need to result, get a starting angle and division
 			angleAdd = twicePi / divisor
-			if divisor < 3 and (blob.speed > 0) then 
+			if divisor < 3 and blob.speed > 0 then 
 				 -- one or two guards should unit in front of unit first
 				angle = blob.vectorAngle
 				blob.lastAngle = angle
@@ -494,7 +527,11 @@ local function AssignCombat(blob)
 				-- grab an angle from an already slotted unit
 				angle = blob.slotted[1].angle
 				blob.lastAngle = angle
+			elseif blob.willSlot[1].x then
+				-- angle from a unit's position
+				angle = AngleAtoB(blob.x, blob.z, blob.willSlot[1].x, blob.willSlot[1].z)
 			else
+				-- random angle
 				angle = random() * twicePi
 				blob.lastAngle = angle
 			end
@@ -619,7 +656,10 @@ local function AssignRemaining(blob)
 				if #blob.willGuard > 1 then
 					for ti = 1, #blob.willGuard do
 						local target = blob.willGuard[ti]
-						if target ~= unit then unitID = target.unitID end
+						if target ~= unit then
+							unitID = target.unitID
+							break
+						end
 					end
 				end
 			else
@@ -674,7 +714,7 @@ function widget:UnitCommand(unitID, unitDefID, unitTeam, cmdID, cmdOpts, cmdPara
 	end
 	-- below is not a widget command
 	unit.humanOrder = { cmdID = cmdID, cmdParams = cmdParams, cmdOpts = cmdOpts }
-	unit.stopped = false
+	unit.stopped = nil
 end
 
 function widget:UnitIdle(unitID, unitDefID, teamID)
@@ -711,15 +751,15 @@ end
 
 function widget:GameFrame(gameFrame)
 	if gameFrame % 30 == 0 then
+		-- check for changes in units from group to group or removed from group
 		for unitID, unit in pairs(unitsByID) do
 			local groupID = Spring.GetUnitGroup(unitID)
-			if groupID == nil then
-				ClearUnit(unitID)
-			elseif groupID ~= unit.lastGroupID and unit.angle then
-				local blob = blobs[groupID]
+			if groupID ~= unit.lastGroupID and unit.angle then
+				local blob = blobs[unit.lastGroupID]
 				if blob then blob.needSlotting = true end
 				unit.angle = nil
 			end
+			if groupID == nil then ClearUnit(unitID) end
 			unit.lastGroupID = groupID
 		end
 		for groupID, blob in pairs(blobs) do
